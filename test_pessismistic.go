@@ -22,6 +22,7 @@ var (
 	concurrency  = flag.Int("concurrency", 32, "concurrency")
 	loadData     = flag.Bool("load-data", false, "load data before run")
 	tableSize    = flag.Uint64("table-size", 400000, "table size")
+	prepareStmt  = flag.Bool("prepare-stmt", true, "use prepared statement")
 	ignoreO      = flag.String("ignore-o", "9007,1105", "ignored error code for optimistic transaction, separated by comma")
 	ignoreP      = flag.String("ignore-p", "1213", "ignored error code for pessimistic transaction, separated by comma")
 	mode         = flag.String("mode", "mix", "transaction mode, mix|pessimistic|optimistic")
@@ -106,6 +107,7 @@ type Session struct {
 	addedCount    int
 	txnStart      time.Time
 	commitStart   time.Time
+	stmtCache     map[string]*sql.Stmt
 }
 
 func NewSession(db *sql.DB, seID, maxSize uint64, numPartitions uint64) (*Session, error) {
@@ -115,9 +117,10 @@ func NewSession(db *sql.DB, seID, maxSize uint64, numPartitions uint64) (*Sessio
 		return nil, err
 	}
 	se := &Session{
-		seID: seID,
-		conn: con,
-		ran:  newRandIDGenerator(maxSize, numPartitions),
+		seID:      seID,
+		conn:      con,
+		ran:       newRandIDGenerator(maxSize, numPartitions),
+		stmtCache: make(map[string]*sql.Stmt),
 	}
 	switch *mode {
 	case "pessimistic":
@@ -137,6 +140,20 @@ func NewSession(db *sql.DB, seID, maxSize uint64, numPartitions uint64) (*Sessio
 		se.plainSelect,
 	)
 	return se, nil
+}
+
+func (se *Session) getAndCacheStmt(ctx context.Context, query string) (*sql.Stmt, error) {
+	if stmt, ok := se.stmtCache[query]; ok {
+		return stmt, nil
+	}
+
+	stmt, err := se.conn.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	se.stmtCache[query] = stmt
+	return stmt, nil
 }
 
 func (se *Session) runTransaction(parent context.Context) error {
@@ -163,7 +180,7 @@ func (se *Session) runTransaction(parent context.Context) error {
 	}
 	// Make sure the addedCount is subtracted
 	if se.addedCount > 0 {
-		err = se.executeDML(ctx, "update t set c = c - %d where id = %d", se.addedCount, se.ran.nextRowID())
+		err = se.executeDML(ctx, "update t set c = c - ? where id = ?", se.addedCount, se.ran.nextRowID())
 		if err != nil {
 			se.handleError(ctx, err, false)
 			return nil
@@ -193,21 +210,21 @@ func (se *Session) runInsertDeleteTransaction(parent context.Context) error {
 	}
 	for i := 0; i < 4; i++ {
 		rowID := se.ran.nextRowID()
-		selectSQL := fmt.Sprintf("select c from t where id = %d for update", rowID)
-		row := se.conn.QueryRowContext(ctx, selectSQL)
+		selectSQL := "select c from t where id = ? for update"
+		row := se.conn.QueryRowContext(ctx, selectSQL, rowID)
 		var c int64
 		err = row.Scan(&c)
 		if err == sql.ErrNoRows {
-			insertSQL := fmt.Sprintf("insert t values (%d, %d, %d, 0)", rowID, rowID, rowID)
-			_, err = se.conn.ExecContext(ctx, insertSQL)
+			insertSQL := "insert t values (?, ?, ?, 0)"
+			_, err = se.conn.ExecContext(ctx, insertSQL, rowID, rowID, rowID)
 			if err != nil {
 				if getErrorCode(err) != 1062 {
 					log.Println("insert err", err)
 				}
 			}
 		} else {
-			deleteSQL := fmt.Sprintf("delete from t where id = %d", rowID)
-			_, err = se.conn.ExecContext(ctx, deleteSQL)
+			deleteSQL := "delete from t where id = ?"
+			_, err = se.conn.ExecContext(ctx, deleteSQL, rowID)
 			if err != nil {
 				log.Println("delete err", err)
 			}
@@ -273,91 +290,115 @@ func (se *Session) Run(wg *sync.WaitGroup) {
 
 func (se *Session) deleteInsert(ctx context.Context) error {
 	rowID := se.ran.nextRowID()
-	row := se.conn.QueryRowContext(ctx, fmt.Sprintf("select c from t where id = %d for update", rowID))
+	row := se.conn.QueryRowContext(ctx, "select c from t where id = ? for update", rowID)
 	var cnt int64
 	err := row.Scan(&cnt)
 	if err != nil {
 		return err
 	}
-	if err = se.executeDML(ctx, "delete from t where id = %d", rowID); err != nil {
+	if err = se.executeDML(ctx, "delete from t where id = ?", rowID); err != nil {
 		return err
 	}
-	return se.executeDML(ctx, "insert t values (%d, %d, %d, %d)",
+	return se.executeDML(ctx, "insert t values (?, ?, ?, ?)",
 		rowID, se.ran.nextUniqueIndex(), rowID, cnt+2)
 }
 
 func (se *Session) replace(ctx context.Context) error {
 	rowID := se.ran.nextRowID()
-	row := se.conn.QueryRowContext(ctx, fmt.Sprintf("select c from t where id = %d for update", rowID))
+	row := se.conn.QueryRowContext(ctx, "select c from t where id = ? for update", rowID)
 	var cnt int64
 	err := row.Scan(&cnt)
 	if err != nil {
 		return err
 	}
 	// When replace on existing records, the semantic is equal to `delete then insert`, so the cnt should `+2`
-	return se.executeDML(ctx, "replace t values (%d, %d, %d, %d)",
+	return se.executeDML(ctx, "replace t values (?, ?, ?, ?)",
 		rowID, se.ran.nextUniqueIndex(), rowID, cnt+2)
 }
 
 func (se *Session) updateIndex(ctx context.Context) error {
-	return se.executeDML(ctx, "update t set i = i + 1, c = c + 1 where id in (%d, %d)", se.ran.nextRowID(), se.ran.nextRowID())
+	return se.executeDML(ctx, "update t set i = i + 1, c = c + 1 where id in (?, ?)", se.ran.nextRowID(), se.ran.nextRowID())
 }
 
 func (se *Session) updateNonIndex(ctx context.Context) error {
-	return se.executeDML(ctx, "update t set c = c + 1 where id in (%d, %d)", se.ran.nextRowID(), se.ran.nextRowID())
+	return se.executeDML(ctx, "update t set c = c + 1 where id in (?, ?)", se.ran.nextRowID(), se.ran.nextRowID())
 }
 
 // updateUniqueIndex make sure there is no conflict on the unique index by randomly generate the unique index value
 func (se *Session) updateUniqueIndex(ctx context.Context) error {
-	return se.executeDML(ctx, "update t set u = %d, c = c + 1 where id = %d",
+	return se.executeDML(ctx, "update t set u = ?, c = c + 1 where id = ?",
 		se.ran.nextUniqueIndex(), se.ran.nextRowID())
 }
 
 func (se *Session) updateRange(ctx context.Context) error {
 	beginRowID := se.ran.nextRowID() + 2 // add 2 to avoid high conflict rate.
 	endRowID := beginRowID + 10
-	return se.executeDML(ctx, "update t set c = c + 1 where id between %d and %d", beginRowID, endRowID)
+	return se.executeDML(ctx, "update t set c = c + 1 where id between ? and ?", beginRowID, endRowID)
 }
 
 func (se *Session) updateIndexRange(ctx context.Context) error {
 	beginRowID := se.ran.nextRowID() + 2 // add 2 to avoid high conflict rate.
 	endRowID := beginRowID + 10
-	return se.executeDML(ctx, "update t set i = i + 1, c = c + 1 where id between %d and %d", beginRowID, endRowID)
+	return se.executeDML(ctx, "update t set i = i + 1, c = c + 1 where id between ? and ?", beginRowID, endRowID)
 }
 
 func (se *Session) plainSelect(ctx context.Context) error {
 	beginRowID := se.ran.nextRowID()
 	endRowID := beginRowID + 10
-	return se.executeSelect(ctx, "select * from t where id between %d and %d", beginRowID, endRowID)
+	return se.executeSelect(ctx, "select * from t where id between ? and ?", beginRowID, endRowID)
 }
 
 func (se *Session) selectForUpdate(ctx context.Context) error {
-	return se.executeSelect(ctx, "select * from t where id in (%d, %d) for update",
+	return se.executeSelect(ctx, "select * from t where id in (?, ?) for update",
 		se.ran.nextRowID(), se.ran.nextRowID())
 }
 
 func (se *Session) executeDML(ctx context.Context, sqlFormat string, args ...interface{}) error {
-	sql := fmt.Sprintf(sqlFormat, args...)
-	res, err := se.conn.ExecContext(ctx, sql)
-	if err != nil {
-		return err
+	var res sql.Result
+	var err error
+	if *prepareStmt {
+		stmt, err := se.getAndCacheStmt(ctx, sqlFormat)
+		if err != nil {
+			return err
+		}
+		res, err = stmt.ExecContext(ctx, args...)
+		if err != nil {
+			return err
+		}
+	} else {
+		res, err = se.conn.ExecContext(ctx, sqlFormat, args...)
+		if err != nil {
+			return err
+		}
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return err
 	}
 	if affected == 0 {
-		return errors.New("affected row is 0, " + sql)
+		return errors.New(fmt.Sprintf("affected row is 0, sqlFormat: %s, %v", sqlFormat, args))
 	}
 	se.addedCount += int(affected)
 	return nil
 }
 
 func (se *Session) executeSelect(ctx context.Context, sqlFormat string, args ...interface{}) error {
-	sql := fmt.Sprintf(sqlFormat, args...)
-	rows, err := se.conn.QueryContext(ctx, sql)
-	if err != nil {
-		return err
+	var rows *sql.Rows
+	var err error
+	if *prepareStmt {
+		stmt, err := se.getAndCacheStmt(ctx, sqlFormat)
+		if err != nil {
+			return err
+		}
+		rows, err = stmt.QueryContext(ctx, args...)
+		if err != nil {
+			return err
+		}
+	} else {
+		rows, err = se.conn.QueryContext(ctx, sqlFormat, args...)
+		if err != nil {
+			return err
+		}
 	}
 	for rows.Next() {
 	}
