@@ -131,6 +131,7 @@ func NewSession(db *sql.DB, seID, maxSize uint64, numPartitions uint64) (*Sessio
 		se.updateIndexRange,
 		se.updateRange,
 		se.updateUniqueIndex,
+		se.replace,
 		se.deleteInsert,
 		se.selectForUpdate,
 		se.plainSelect,
@@ -282,6 +283,19 @@ func (se *Session) deleteInsert(ctx context.Context) error {
 		return err
 	}
 	return se.executeDML(ctx, "insert t values (%d, %d, %d, %d)",
+		rowID, se.ran.nextUniqueIndex(), rowID, cnt+2)
+}
+
+func (se *Session) replace(ctx context.Context) error {
+	rowID := se.ran.nextRowID()
+	row := se.conn.QueryRowContext(ctx, fmt.Sprintf("select c from t where id = %d for update", rowID))
+	var cnt int64
+	err := row.Scan(&cnt)
+	if err != nil {
+		return err
+	}
+	// When replace on existing records, the semantic is equal to `delete then insert`, so the cnt should `+2`
+	return se.executeDML(ctx, "replace t values (%d, %d, %d, %d)",
 		rowID, se.ran.nextUniqueIndex(), rowID, cnt+2)
 }
 
